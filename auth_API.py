@@ -75,7 +75,9 @@ def request_mfa_code(
         timeout=timeout,
     )
 
-    if response.status_code != 200:
+    # Orchestrator returns 204 No Content on success when the code is emailed;
+    # pyedgeconnect's send_mfa accepts both 200 and 204.
+    if response.status_code not in {200, 204}:
         raise RuntimeError(
             "Failed to request 2-factor code. "
             f"HTTP {response.status_code}: {response.text[:500]}"
