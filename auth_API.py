@@ -242,14 +242,23 @@ def main() -> None:
                 timeout=timeout,
             )
 
-            auth_token = headers.get("X-XSRF-TOKEN", "")
-            cookie_header = "; ".join(f"{c.name}={c.value}" for c in session.cookies)
-            try:
-                saved_key = save_session_to_redis(orch_fqdn, auth_token, cookie_header)
-                print(f"Saved Orchestrator session (CSRF token + cookies) to Redis under key: {saved_key}")
-            except RuntimeError as exc:
-                # Caching is auxiliary — a Redis outage must not abort the Orchestrator flow.
-                print(f"Warning: {exc}", file=sys.stderr)
+            if logout_enabled:
+                # We log out at the end of this run, which invalidates the session
+                # server-side — caching it would leave a stale, unusable entry in Redis.
+                print(
+                    "ORCH_LOGOUT=true: not caching the session to Redis "
+                    "(logout would invalidate it).",
+                    file=sys.stderr,
+                )
+            else:
+                auth_token = headers.get("X-XSRF-TOKEN", "")
+                cookie_header = "; ".join(f"{c.name}={c.value}" for c in session.cookies)
+                try:
+                    saved_key = save_session_to_redis(orch_fqdn, auth_token, cookie_header)
+                    print(f"Saved Orchestrator session (CSRF token + cookies) to Redis under key: {saved_key}")
+                except RuntimeError as exc:
+                    # Caching is auxiliary — a Redis outage must not abort the Orchestrator flow.
+                    print(f"Warning: {exc}", file=sys.stderr)
 
             appliances_url = (
                 f"https://{orch_fqdn}/gms/rest/appliance"
