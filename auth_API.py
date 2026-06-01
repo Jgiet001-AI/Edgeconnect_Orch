@@ -206,6 +206,11 @@ def main() -> None:
         "false",
         "no",
     }
+    logout_enabled = os.getenv("ORCH_LOGOUT", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
     timeout = (9.15, 12)
 
@@ -263,13 +268,22 @@ def main() -> None:
             print(response.text)
 
         finally:
-            logout_from_orchestrator(
-                session,
-                orch_fqdn,
-                headers,
-                verify_ssl=verify_ssl,
-                timeout=timeout,
-            )
+            if logout_enabled:
+                logout_from_orchestrator(
+                    session,
+                    orch_fqdn,
+                    headers,
+                    verify_ssl=verify_ssl,
+                    timeout=timeout,
+                )
+            else:
+                # Keep the Orchestrator session alive so the cached cookie/CSRF pair in
+                # Redis stays valid for reuse. Set ORCH_LOGOUT=true to log out instead.
+                print(
+                    "Skipping logout to keep the cached Orchestrator session valid "
+                    "(set ORCH_LOGOUT=true to log out).",
+                    file=sys.stderr,
+                )
 
 
 if __name__ == "__main__":
