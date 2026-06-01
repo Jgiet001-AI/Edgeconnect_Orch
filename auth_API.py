@@ -2,6 +2,7 @@ import os
 import sys
 from pathlib import Path
 
+import redis
 import requests
 
 
@@ -45,6 +46,33 @@ def require_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
+
+
+def save_session_to_redis(orch_fqdn: str, csrf_token: str, cookie_header: str) -> str:
+    # Persist the Orchestrator session (CSRF token + cookies) to the user's local Redis.
+    # Stored as a hash keyed by orchestrator FQDN so multiple orchestrators don't collide.
+    # delete+hset replaces any prior value every run (and avoids WRONGTYPE on a former string).
+    redis_host = os.getenv("REDIS_HOST", "localhost")
+    redis_port = int(os.getenv("REDIS_PORT", "6379"))
+    redis_db = int(os.getenv("REDIS_DB", "0"))
+
+    key = f"orchestratorEdge[{orch_fqdn}]"
+
+    try:
+        client = redis.Redis(
+            host=redis_host,
+            port=redis_port,
+            db=redis_db,
+            decode_responses=True,
+        )
+        client.delete(key)
+        client.hset(key, mapping={"csrfToken": csrf_token, "cookie": cookie_header})
+    except redis.RedisError as exc:
+        raise RuntimeError(
+            f"Failed to save session to Redis at {redis_host}:{redis_port}: {exc}"
+        ) from exc
+
+    return key
 
 
 def request_mfa_code(
@@ -208,6 +236,11 @@ def main() -> None:
                 verify_ssl=verify_ssl,
                 timeout=timeout,
             )
+
+            auth_token = headers.get("X-XSRF-TOKEN", "")
+            cookie_header = "; ".join(f"{c.name}={c.value}" for c in session.cookies)
+            saved_key = save_session_to_redis(orch_fqdn, auth_token, cookie_header)
+            print(f"Saved Orchestrator session (CSRF token + cookies) to Redis under key: {saved_key}")
 
             appliances_url = (
                 f"https://{orch_fqdn}/gms/rest/appliance"
