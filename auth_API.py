@@ -244,8 +244,12 @@ def main() -> None:
 
             auth_token = headers.get("X-XSRF-TOKEN", "")
             cookie_header = "; ".join(f"{c.name}={c.value}" for c in session.cookies)
-            saved_key = save_session_to_redis(orch_fqdn, auth_token, cookie_header)
-            print(f"Saved Orchestrator session (CSRF token + cookies) to Redis under key: {saved_key}")
+            try:
+                saved_key = save_session_to_redis(orch_fqdn, auth_token, cookie_header)
+                print(f"Saved Orchestrator session (CSRF token + cookies) to Redis under key: {saved_key}")
+            except RuntimeError as exc:
+                # Caching is auxiliary — a Redis outage must not abort the Orchestrator flow.
+                print(f"Warning: {exc}", file=sys.stderr)
 
             appliances_url = (
                 f"https://{orch_fqdn}/gms/rest/appliance"
