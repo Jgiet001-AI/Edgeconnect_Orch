@@ -47,12 +47,48 @@ def require_env(name: str) -> str:
     return value
 
 
+def request_mfa_code(
+    session: requests.Session,
+    orch_fqdn: str,
+    orch_user: str,
+    orch_password: str,
+    *,
+    verify_ssl: bool = True,
+    timeout: tuple[float, float] = (9.15, 12),
+) -> None:
+    # Ask Orchestrator to email a one-time 2-factor code to the user's mailbox.
+    # isEncrypted/randomizer are only needed for client-side password encryption;
+    # we send over HTTPS, so they are omitted.
+    login_token_url = (
+        f"https://{orch_fqdn}/gms/rest/authentication/loginToken"
+        "?source=menu_rest_apis_id"
+    )
+
+    response = session.post(
+        login_token_url,
+        json={
+            "user": orch_user,
+            "password": orch_password,
+            "TempCode": True,
+        },
+        verify=verify_ssl,
+        timeout=timeout,
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            "Failed to request 2-factor code. "
+            f"HTTP {response.status_code}: {response.text[:500]}"
+        )
+
+
 def login_to_orchestrator(
     session: requests.Session,
     orch_fqdn: str,
     orch_user: str,
     orch_password: str,
     *,
+    token: str = "",
     login_type: int = 2,
     verify_ssl: bool = True,
     timeout: tuple[float, float] = (9.15, 12),
@@ -69,7 +105,7 @@ def login_to_orchestrator(
         json={
             "user": orch_user,
             "password": orch_password,
-            "token": "",
+            "token": token,
             "loginType": login_type,
         },
         verify=verify_ssl,
@@ -135,6 +171,11 @@ def main() -> None:
         "false",
         "no",
     }
+    mfa_enabled = os.getenv("ORCH_MFA", "true").lower() not in {
+        "0",
+        "false",
+        "no",
+    }
 
     timeout = (9.15, 12)
 
@@ -142,11 +183,25 @@ def main() -> None:
         headers: dict[str, str] = {}
 
         try:
+            token = ""
+
+            if mfa_enabled:
+                request_mfa_code(
+                    session,
+                    orch_fqdn,
+                    orch_user,
+                    orch_password,
+                    verify_ssl=verify_ssl,
+                    timeout=timeout,
+                )
+                token = input("Enter the 2-factor code emailed to you: ").strip()
+
             headers = login_to_orchestrator(
                 session,
                 orch_fqdn,
                 orch_user,
                 orch_password,
+                token=token,
                 login_type=login_type,
                 verify_ssl=verify_ssl,
                 timeout=timeout,
