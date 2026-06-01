@@ -216,6 +216,7 @@ def main() -> None:
 
     with requests.Session() as session:
         headers: dict[str, str] = {}
+        session_cached = False
 
         try:
             token = ""
@@ -255,6 +256,7 @@ def main() -> None:
                 cookie_header = "; ".join(f"{c.name}={c.value}" for c in session.cookies)
                 try:
                     saved_key = save_session_to_redis(orch_fqdn, auth_token, cookie_header)
+                    session_cached = True
                     print(f"Saved Orchestrator session (CSRF token + cookies) to Redis under key: {saved_key}")
                 except RuntimeError as exc:
                     # Caching is auxiliary — a Redis outage must not abort the Orchestrator flow.
@@ -281,21 +283,22 @@ def main() -> None:
             print(response.text)
 
         finally:
-            if logout_enabled:
+            # Only keep the session alive when we actually saved a reusable copy to
+            # Redis. If logout was requested, or the cache write failed/was skipped,
+            # log out so we don't orphan a server-side session nobody can reuse.
+            if session_cached:
+                print(
+                    "Skipping logout to keep the cached Orchestrator session valid "
+                    "(set ORCH_LOGOUT=true to log out).",
+                    file=sys.stderr,
+                )
+            else:
                 logout_from_orchestrator(
                     session,
                     orch_fqdn,
                     headers,
                     verify_ssl=verify_ssl,
                     timeout=timeout,
-                )
-            else:
-                # Keep the Orchestrator session alive so the cached cookie/CSRF pair in
-                # Redis stays valid for reuse. Set ORCH_LOGOUT=true to log out instead.
-                print(
-                    "Skipping logout to keep the cached Orchestrator session valid "
-                    "(set ORCH_LOGOUT=true to log out).",
-                    file=sys.stderr,
                 )
 
 
