@@ -53,12 +53,14 @@ def save_session_to_redis(orch_fqdn: str, csrf_token: str, cookie_header: str) -
     # Stored as a hash keyed by orchestrator FQDN so multiple orchestrators don't collide.
     # delete+hset replaces any prior value every run (and avoids WRONGTYPE on a former string).
     redis_host = os.getenv("REDIS_HOST", "localhost")
-    redis_port = int(os.getenv("REDIS_PORT", "6379"))
-    redis_db = int(os.getenv("REDIS_DB", "0"))
-
     key = f"orchestratorEdge[{orch_fqdn}]"
 
     try:
+        # Parse numeric config inside the try so a typo (non-numeric or blank REDIS_PORT/
+        # REDIS_DB) raises RuntimeError, which the caller treats as non-fatal — rather than
+        # an uncaught ValueError that would abort the Orchestrator flow.
+        redis_port = int(os.getenv("REDIS_PORT", "6379"))
+        redis_db = int(os.getenv("REDIS_DB", "0"))
         client = redis.Redis(
             host=redis_host,
             port=redis_port,
@@ -67,9 +69,9 @@ def save_session_to_redis(orch_fqdn: str, csrf_token: str, cookie_header: str) -
         )
         client.delete(key)
         client.hset(key, mapping={"csrfToken": csrf_token, "cookie": cookie_header})
-    except redis.RedisError as exc:
+    except (redis.RedisError, ValueError) as exc:
         raise RuntimeError(
-            f"Failed to save session to Redis at {redis_host}:{redis_port}: {exc}"
+            f"Failed to save session to Redis (host {redis_host}): {exc}"
         ) from exc
 
     return key
