@@ -4,5 +4,6 @@ version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
     "pyedgeconnect[dev]>=0.16.0a1",
+    "redis>=5.0.0",
     "requests>=2.34.2",
 ]

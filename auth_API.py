@@ -2,6 +2,7 @@ import os
 import sys
 from pathlib import Path
 
+import redis
 import requests
 
 
@@ -45,6 +46,56 @@ def require_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
+
+
+def _connect_redis() -> redis.Redis:
+    # Build a Redis client from env config. A non-numeric or blank REDIS_PORT/REDIS_DB raises
+    # RuntimeError so callers can treat caching as non-fatal rather than letting an uncaught
+    # ValueError abort the Orchestrator flow. redis.Redis() is lazy — actual connection errors
+    # surface as redis.RedisError at the first command, handled by each caller.
+    redis_host = os.getenv("REDIS_HOST", "localhost")
+    try:
+        redis_port = int(os.getenv("REDIS_PORT", "6379"))
+        redis_db = int(os.getenv("REDIS_DB", "0"))
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid Redis config (host {redis_host}): {exc}") from exc
+
+    return redis.Redis(
+        host=redis_host,
+        port=redis_port,
+        db=redis_db,
+        decode_responses=True,
+    )
+
+
+def save_session_to_redis(orch_fqdn: str, csrf_token: str, cookie_header: str) -> str:
+    # Persist the Orchestrator session (CSRF token + cookies) to the user's local Redis.
+    # Stored as a hash keyed by orchestrator FQDN so multiple orchestrators don't collide.
+    # delete+hset replaces any prior value every run (and avoids WRONGTYPE on a former string).
+    key = f"orchestratorEdge[{orch_fqdn}]"
+
+    try:
+        client = _connect_redis()
+        client.delete(key)
+        client.hset(key, mapping={"csrfToken": csrf_token, "cookie": cookie_header})
+    except redis.RedisError as exc:
+        raise RuntimeError(f"Failed to save session to Redis: {exc}") from exc
+
+    return key
+
+
+def clear_session_in_redis(orch_fqdn: str) -> str:
+    # Remove any cached session for this orchestrator. Used when logging out, so a stale
+    # entry from a previous run isn't left behind for consumers to reuse.
+    key = f"orchestratorEdge[{orch_fqdn}]"
+
+    try:
+        client = _connect_redis()
+        client.delete(key)
+    except redis.RedisError as exc:
+        raise RuntimeError(f"Failed to clear session in Redis: {exc}") from exc
+
+    return key
 
 
 def request_mfa_code(
@@ -178,11 +229,17 @@ def main() -> None:
         "false",
         "no",
     }
+    logout_enabled = os.getenv("ORCH_LOGOUT", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
     timeout = (9.15, 12)
 
     with requests.Session() as session:
         headers: dict[str, str] = {}
+        session_cached = False
 
         try:
             token = ""
@@ -209,6 +266,28 @@ def main() -> None:
                 timeout=timeout,
             )
 
+            if logout_enabled:
+                # Logout invalidates this session server-side, so don't cache it — and clear
+                # any entry a previous run left, so consumers can't reuse an invalid session.
+                try:
+                    cleared_key = clear_session_in_redis(orch_fqdn)
+                    print(
+                        f"ORCH_LOGOUT=true: cleared any cached session at {cleared_key}.",
+                        file=sys.stderr,
+                    )
+                except RuntimeError as exc:
+                    print(f"Warning: {exc}", file=sys.stderr)
+            else:
+                auth_token = headers.get("X-XSRF-TOKEN", "")
+                cookie_header = "; ".join(f"{c.name}={c.value}" for c in session.cookies)
+                try:
+                    saved_key = save_session_to_redis(orch_fqdn, auth_token, cookie_header)
+                    session_cached = True
+                    print(f"Saved Orchestrator session (CSRF token + cookies) to Redis under key: {saved_key}")
+                except RuntimeError as exc:
+                    # Caching is auxiliary — a Redis outage must not abort the Orchestrator flow.
+                    print(f"Warning: {exc}", file=sys.stderr)
+
             appliances_url = (
                 f"https://{orch_fqdn}/gms/rest/appliance"
                 "?source=menu_rest_apis_id"
@@ -230,13 +309,23 @@ def main() -> None:
             print(response.text)
 
         finally:
-            logout_from_orchestrator(
-                session,
-                orch_fqdn,
-                headers,
-                verify_ssl=verify_ssl,
-                timeout=timeout,
-            )
+            # Only keep the session alive when we actually saved a reusable copy to
+            # Redis. If logout was requested, or the cache write failed/was skipped,
+            # log out so we don't orphan a server-side session nobody can reuse.
+            if session_cached:
+                print(
+                    "Skipping logout to keep the cached Orchestrator session valid "
+                    "(set ORCH_LOGOUT=true to log out).",
+                    file=sys.stderr,
+                )
+            else:
+                logout_from_orchestrator(
+                    session,
+                    orch_fqdn,
+                    headers,
+                    verify_ssl=verify_ssl,
+                    timeout=timeout,
+                )
 
 
 if __name__ == "__main__":
