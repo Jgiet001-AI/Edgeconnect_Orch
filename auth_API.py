@@ -48,31 +48,52 @@ def require_env(name: str) -> str:
     return value
 
 
+def _connect_redis() -> redis.Redis:
+    # Build a Redis client from env config. A non-numeric or blank REDIS_PORT/REDIS_DB raises
+    # RuntimeError so callers can treat caching as non-fatal rather than letting an uncaught
+    # ValueError abort the Orchestrator flow. redis.Redis() is lazy — actual connection errors
+    # surface as redis.RedisError at the first command, handled by each caller.
+    redis_host = os.getenv("REDIS_HOST", "localhost")
+    try:
+        redis_port = int(os.getenv("REDIS_PORT", "6379"))
+        redis_db = int(os.getenv("REDIS_DB", "0"))
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid Redis config (host {redis_host}): {exc}") from exc
+
+    return redis.Redis(
+        host=redis_host,
+        port=redis_port,
+        db=redis_db,
+        decode_responses=True,
+    )
+
+
 def save_session_to_redis(orch_fqdn: str, csrf_token: str, cookie_header: str) -> str:
     # Persist the Orchestrator session (CSRF token + cookies) to the user's local Redis.
     # Stored as a hash keyed by orchestrator FQDN so multiple orchestrators don't collide.
     # delete+hset replaces any prior value every run (and avoids WRONGTYPE on a former string).
-    redis_host = os.getenv("REDIS_HOST", "localhost")
     key = f"orchestratorEdge[{orch_fqdn}]"
 
     try:
-        # Parse numeric config inside the try so a typo (non-numeric or blank REDIS_PORT/
-        # REDIS_DB) raises RuntimeError, which the caller treats as non-fatal — rather than
-        # an uncaught ValueError that would abort the Orchestrator flow.
-        redis_port = int(os.getenv("REDIS_PORT", "6379"))
-        redis_db = int(os.getenv("REDIS_DB", "0"))
-        client = redis.Redis(
-            host=redis_host,
-            port=redis_port,
-            db=redis_db,
-            decode_responses=True,
-        )
+        client = _connect_redis()
         client.delete(key)
         client.hset(key, mapping={"csrfToken": csrf_token, "cookie": cookie_header})
-    except (redis.RedisError, ValueError) as exc:
-        raise RuntimeError(
-            f"Failed to save session to Redis (host {redis_host}): {exc}"
-        ) from exc
+    except redis.RedisError as exc:
+        raise RuntimeError(f"Failed to save session to Redis: {exc}") from exc
+
+    return key
+
+
+def clear_session_in_redis(orch_fqdn: str) -> str:
+    # Remove any cached session for this orchestrator. Used when logging out, so a stale
+    # entry from a previous run isn't left behind for consumers to reuse.
+    key = f"orchestratorEdge[{orch_fqdn}]"
+
+    try:
+        client = _connect_redis()
+        client.delete(key)
+    except redis.RedisError as exc:
+        raise RuntimeError(f"Failed to clear session in Redis: {exc}") from exc
 
     return key
 
@@ -246,13 +267,16 @@ def main() -> None:
             )
 
             if logout_enabled:
-                # We log out at the end of this run, which invalidates the session
-                # server-side — caching it would leave a stale, unusable entry in Redis.
-                print(
-                    "ORCH_LOGOUT=true: not caching the session to Redis "
-                    "(logout would invalidate it).",
-                    file=sys.stderr,
-                )
+                # Logout invalidates this session server-side, so don't cache it — and clear
+                # any entry a previous run left, so consumers can't reuse an invalid session.
+                try:
+                    cleared_key = clear_session_in_redis(orch_fqdn)
+                    print(
+                        f"ORCH_LOGOUT=true: cleared any cached session at {cleared_key}.",
+                        file=sys.stderr,
+                    )
+                except RuntimeError as exc:
+                    print(f"Warning: {exc}", file=sys.stderr)
             else:
                 auth_token = headers.get("X-XSRF-TOKEN", "")
                 cookie_header = "; ".join(f"{c.name}={c.value}" for c in session.cookies)
